@@ -76,11 +76,15 @@ map.addControl(drawControl);
 
 let currentRect = null;
 let rotateHandleMarker = null;
+let rotateHandleStem = null;
 let isRotatingSelection = false;
 
 function setSelection(layer) {
   drawnItems.clearLayers();
   currentRect = layer;
+  currentRect._rotationAngle = 0;
+  currentRect._origCenter = currentRect.getBounds().getCenter();
+  currentRect._origPoints = getShapeLatLngs(currentRect);
   makeSelectionDraggable(layer);
   drawnItems.addLayer(currentRect);
   updateBboxFields();
@@ -103,6 +107,19 @@ function rotateShapeCoords(item, center, rad) {
     return item.map(child => rotateShapeCoords(child, center, rad));
   }
   return rotateSingleLatLng(item, center, rad);
+}
+
+function flattenLatLngs(items) {
+  const out = [];
+  function walk(x) {
+    if (Array.isArray(x)) {
+      for (const item of x) walk(item);
+    } else if (x && typeof x.lat === 'number') {
+      out.push(x);
+    }
+  }
+  walk(items);
+  return out;
 }
 
 function getShapeLatLngs(layer) {
@@ -134,41 +151,82 @@ function getShapeLatLngs(layer) {
   return [];
 }
 
-function rotateSelectionBy(deg) {
-  if (!currentRect) return;
-  const center = currentRect.getBounds().getCenter();
-  const rad = deg * Math.PI / 180;
-  const initialPts = getShapeLatLngs(currentRect);
-  const rotated = rotateShapeCoords(initialPts, center, rad);
-
-  if (currentRect instanceof L.Rectangle || currentRect instanceof L.Circle) {
-    drawnItems.removeLayer(currentRect);
-    currentRect = L.polygon(rotated, SEL_STYLE);
-    makeSelectionDraggable(currentRect);
-    drawnItems.addLayer(currentRect);
-  } else {
-    currentRect.setLatLngs(rotated);
+function getShapeTopExtentPx(origPoints, origCenter) {
+  const cPt = map.latLngToLayerPoint(origCenter);
+  let maxUpPx = 25;
+  for (const pt of flattenLatLngs(origPoints)) {
+    const p = map.latLngToLayerPoint(pt);
+    const up = cPt.y - p.y;
+    if (up > maxUpPx) maxUpPx = up;
   }
+  return maxUpPx;
+}
 
-  updateBboxFields();
-  updateRotateHandle();
+function calcRotateHandlePositions(center, origPoints, angle) {
+  const cPt = map.latLngToLayerPoint(center);
+  const maxUpPx = getShapeTopExtentPx(origPoints, center);
+  const stemLen = 24;
+  const handleRadius = maxUpPx + stemLen;
+
+  const alpha = -Math.PI / 2 + angle;
+  const dx = Math.cos(alpha);
+  const dy = Math.sin(alpha);
+
+  const hPt = L.point(cPt.x + handleRadius * dx, cPt.y + handleRadius * dy);
+  const sPt = L.point(cPt.x + maxUpPx * dx, cPt.y + maxUpPx * dy);
+
+  return {
+    handleLatLng: map.layerPointToLatLng(hPt),
+    stemStartLatLng: map.layerPointToLatLng(sPt),
+    cPt, maxUpPx, stemLen, handleRadius
+  };
+}
+
+function removeRotateHandle() {
+  if (rotateHandleMarker) {
+    map.removeLayer(rotateHandleMarker);
+    rotateHandleMarker = null;
+  }
+  if (rotateHandleStem) {
+    map.removeLayer(rotateHandleStem);
+    rotateHandleStem = null;
+  }
 }
 
 function updateRotateHandle() {
   if (!currentRect || !drawnItems.hasLayer(currentRect)) {
-    if (rotateHandleMarker) {
-      map.removeLayer(rotateHandleMarker);
-      rotateHandleMarker = null;
-    }
+    removeRotateHandle();
     return;
   }
-  const bounds = currentRect.getBounds();
-  const topCenter = L.latLng(bounds.getNorth(), bounds.getCenter().lng);
+
+  if (!currentRect._origCenter) {
+    currentRect._origCenter = currentRect.getBounds().getCenter();
+    currentRect._origPoints = getShapeLatLngs(currentRect);
+    currentRect._rotationAngle = 0;
+  }
+
+  const pos = calcRotateHandlePositions(
+    currentRect._origCenter,
+    currentRect._origPoints,
+    currentRect._rotationAngle || 0
+  );
+
+  if (!rotateHandleStem) {
+    rotateHandleStem = L.polyline([pos.stemStartLatLng, pos.handleLatLng], {
+      color: '#a5e266',
+      weight: 2,
+      opacity: 0.9,
+      interactive: false,
+      zIndexOffset: 1900,
+    }).addTo(map);
+  } else {
+    rotateHandleStem.setLatLngs([pos.stemStartLatLng, pos.handleLatLng]);
+  }
 
   if (!rotateHandleMarker) {
-    createRotateHandle(topCenter);
+    createRotateHandle(pos.handleLatLng);
   } else {
-    rotateHandleMarker.setLatLng(topCenter);
+    rotateHandleMarker.setLatLng(pos.handleLatLng);
     attachRotateHandleEvents(rotateHandleMarker);
   }
 }
@@ -189,11 +247,10 @@ function createRotateHandle(latlng) {
             <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.19"/>
           </svg>
         </button>
-        <div class="rotate-handle-stem"></div>
       </div>
     `,
-    iconSize: [32, 48],
-    iconAnchor: [16, 48],
+    iconSize: [28, 28],
+    iconAnchor: [14, 14],
   });
 
   rotateHandleMarker = L.marker(latlng, {
@@ -203,6 +260,36 @@ function createRotateHandle(latlng) {
   }).addTo(map);
 
   attachRotateHandleEvents(rotateHandleMarker);
+}
+
+function rotateSelectionBy(deg) {
+  if (!currentRect) return;
+  if (!currentRect._origCenter) {
+    currentRect._origCenter = currentRect.getBounds().getCenter();
+    currentRect._origPoints = getShapeLatLngs(currentRect);
+    currentRect._rotationAngle = 0;
+  }
+  const angle = (currentRect._rotationAngle || 0) + (deg * Math.PI / 180);
+  currentRect._rotationAngle = angle;
+
+  const rotated = rotateShapeCoords(currentRect._origPoints, currentRect._origCenter, angle);
+
+  if (currentRect instanceof L.Rectangle || currentRect instanceof L.Circle) {
+    const origCenter = currentRect._origCenter;
+    const origPoints = currentRect._origPoints;
+    drawnItems.removeLayer(currentRect);
+    currentRect = L.polygon(rotated, SEL_STYLE);
+    currentRect._origCenter = origCenter;
+    currentRect._origPoints = origPoints;
+    currentRect._rotationAngle = angle;
+    makeSelectionDraggable(currentRect);
+    drawnItems.addLayer(currentRect);
+  } else {
+    currentRect.setLatLngs(rotated);
+  }
+
+  updateBboxFields();
+  updateRotateHandle();
 }
 
 function attachRotateHandleEvents(marker) {
@@ -235,28 +322,41 @@ function attachRotateHandleEvents(marker) {
     mapBox.classList.add('rotate-dragging');
     document.body.classList.add('rotate-dragging');
 
-    const center = currentRect.getBounds().getCenter();
-    const centerPt = map.latLngToContainerPoint(center);
-    const startPt = map.mouseEventToContainerPoint(ev);
-    const startAngle = Math.atan2(startPt.y - centerPt.y, startPt.x - centerPt.x);
+    if (!currentRect._origCenter) {
+      currentRect._origCenter = currentRect.getBounds().getCenter();
+      currentRect._origPoints = getShapeLatLngs(currentRect);
+      currentRect._rotationAngle = 0;
+    }
 
-    let initialPts = getShapeLatLngs(currentRect);
+    const center = currentRect._origCenter;
+    const cPt = map.latLngToLayerPoint(center);
+    const startMousePt = map.mouseEventToLayerPoint(ev);
+    const startMouseAngle = Math.atan2(startMousePt.y - cPt.y, startMousePt.x - cPt.x);
+    const startAngle = currentRect._rotationAngle || 0;
+
+    const maxUpPx = getShapeTopExtentPx(currentRect._origPoints, center);
+    const stemLen = 24;
+    const handleRadius = maxUpPx + stemLen;
+
     let moved = false;
 
     const onMove = (e) => {
-      const curPt = map.mouseEventToContainerPoint(e);
-      if (!moved && Math.hypot(curPt.x - startPt.x, curPt.y - startPt.y) < 3) return;
+      const curMousePt = map.mouseEventToLayerPoint(e);
+      if (!moved && Math.hypot(curMousePt.x - startMousePt.x, curMousePt.y - startMousePt.y) < 3) return;
       moved = true;
 
-      const curAngle = Math.atan2(curPt.y - centerPt.y, curPt.x - centerPt.x);
-      let delta = curAngle - startAngle;
+      const curMouseAngle = Math.atan2(curMousePt.y - cPt.y, curMousePt.x - cPt.x);
+      let delta = curMouseAngle - startMouseAngle;
 
       if (e.shiftKey) {
         const snapStep = Math.PI / 12; // 15 degrees
         delta = Math.round(delta / snapStep) * snapStep;
       }
 
-      let deg = (delta * 180 / Math.PI) % 360;
+      const angle = startAngle + delta;
+      currentRect._rotationAngle = angle;
+
+      let deg = (angle * 180 / Math.PI) % 360;
       if (deg > 180) deg -= 360;
       if (deg < -180) deg += 360;
 
@@ -265,20 +365,38 @@ function attachRotateHandleEvents(marker) {
         badge.textContent = `${deg >= 0 ? '+' : ''}${deg.toFixed(1)}°`;
       }
 
-      const rotated = rotateShapeCoords(initialPts, center, delta);
+      const rotated = rotateShapeCoords(currentRect._origPoints, center, angle);
 
       if (currentRect instanceof L.Rectangle || currentRect instanceof L.Circle) {
+        const origCenter = currentRect._origCenter;
+        const origPoints = currentRect._origPoints;
         drawnItems.removeLayer(currentRect);
         currentRect = L.polygon(rotated, SEL_STYLE);
+        currentRect._origCenter = origCenter;
+        currentRect._origPoints = origPoints;
+        currentRect._rotationAngle = angle;
         makeSelectionDraggable(currentRect);
         drawnItems.addLayer(currentRect);
       } else {
         currentRect.setLatLngs(rotated);
       }
 
+      const alpha = -Math.PI / 2 + angle;
+      const dx = Math.cos(alpha);
+      const dy = Math.sin(alpha);
+
+      const hPt = L.point(cPt.x + handleRadius * dx, cPt.y + handleRadius * dy);
+      const sPt = L.point(cPt.x + maxUpPx * dx, cPt.y + maxUpPx * dy);
+
+      const hLatLng = map.layerPointToLatLng(hPt);
+      const sLatLng = map.layerPointToLatLng(sPt);
+
+      marker.setLatLng(hLatLng);
+      if (rotateHandleStem) {
+        rotateHandleStem.setLatLngs([sLatLng, hLatLng]);
+      }
+
       updateBboxFields();
-      const newBounds = currentRect.getBounds();
-      marker.setLatLng(L.latLng(newBounds.getNorth(), newBounds.getCenter().lng));
     };
 
     const onUp = () => {
@@ -346,6 +464,12 @@ function makeSelectionDraggable(layer) {
       moved = true;
       if (isCircle) layer.setLatLng(L.latLng(start.lat + dLat, start.lng + dLng));
       else layer.setLatLngs(shiftLatLngs(start, dLat, dLng));
+      if (currentRect && currentRect._origCenter) {
+        currentRect._origCenter = L.latLng(currentRect._origCenter.lat + dLat, currentRect._origCenter.lng + dLng);
+      }
+      if (currentRect && currentRect._origPoints) {
+        currentRect._origPoints = shiftLatLngs(currentRect._origPoints, dLat, dLng);
+      }
       updateBboxFields();
       updateRotateHandle();
     };
