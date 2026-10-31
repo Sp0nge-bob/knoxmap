@@ -79,11 +79,27 @@ let rotateHandleMarker = null;
 let rotateHandleStem = null;
 let isRotatingSelection = false;
 
+function calculatePivot(layer) {
+  const crs = map.options.crs || L.CRS.EPSG3857;
+  if (layer instanceof L.Circle) {
+    return layer.getLatLng();
+  }
+  const pts = flattenLatLngs(getShapeLatLngs(layer));
+  if (!pts.length) return layer.getBounds().getCenter();
+  let sumX = 0, sumY = 0;
+  for (const pt of pts) {
+    const p = crs.project(pt);
+    sumX += p.x;
+    sumY += p.y;
+  }
+  return crs.unproject(L.point(sumX / pts.length, sumY / pts.length));
+}
+
 function setSelection(layer) {
   drawnItems.clearLayers();
   currentRect = layer;
   currentRect._rotationAngle = 0;
-  currentRect._origCenter = currentRect.getBounds().getCenter();
+  currentRect._pivot = calculatePivot(layer);
   currentRect._origPoints = getShapeLatLngs(currentRect);
   makeSelectionDraggable(layer);
   drawnItems.addLayer(currentRect);
@@ -92,21 +108,24 @@ function setSelection(layer) {
 }
 
 // ---- rotate the selection (Photoshop style) ------------------------------------
-function rotateSingleLatLng(ll, center, rad) {
-  const cosLat = Math.cos(center.lat * Math.PI / 180);
-  const dx = (ll.lng - center.lng) * cosLat;
-  const dy = ll.lat - center.lat;
-  // Clockwise rotation on the map (North is +Y, East is +X)
+function rotateSingleLatLng(ll, pivot, rad) {
+  const crs = map.options.crs || L.CRS.EPSG3857;
+  const pPivot = crs.project(pivot);
+  const p = crs.project(ll);
+  const dx = p.x - pPivot.x;
+  const dy = p.y - pPivot.y;
+  // Pure rigid clockwise rotation in projected Web Mercator coordinates:
+  // Zero distortion, zero drift, center point is 100% frozen in place.
   const rx = dx * Math.cos(rad) + dy * Math.sin(rad);
   const ry = -dx * Math.sin(rad) + dy * Math.cos(rad);
-  return L.latLng(center.lat + ry, wrapLon(center.lng + rx / cosLat));
+  return crs.unproject(L.point(pPivot.x + rx, pPivot.y + ry));
 }
 
-function rotateShapeCoords(item, center, rad) {
+function rotateShapeCoords(item, pivot, rad) {
   if (Array.isArray(item)) {
-    return item.map(child => rotateShapeCoords(child, center, rad));
+    return item.map(child => rotateShapeCoords(child, pivot, rad));
   }
-  return rotateSingleLatLng(item, center, rad);
+  return rotateSingleLatLng(item, pivot, rad);
 }
 
 function flattenLatLngs(items) {
@@ -151,8 +170,8 @@ function getShapeLatLngs(layer) {
   return [];
 }
 
-function getShapeTopExtentPx(origPoints, origCenter) {
-  const cPt = map.latLngToLayerPoint(origCenter);
+function getShapeTopExtentPx(origPoints, pivot) {
+  const cPt = map.latLngToLayerPoint(pivot);
   let maxUpPx = 25;
   for (const pt of flattenLatLngs(origPoints)) {
     const p = map.latLngToLayerPoint(pt);
@@ -162,9 +181,9 @@ function getShapeTopExtentPx(origPoints, origCenter) {
   return maxUpPx;
 }
 
-function calcRotateHandlePositions(center, origPoints, angle) {
-  const cPt = map.latLngToLayerPoint(center);
-  const maxUpPx = getShapeTopExtentPx(origPoints, center);
+function calcRotateHandlePositions(pivot, origPoints, angle) {
+  const cPt = map.latLngToLayerPoint(pivot);
+  const maxUpPx = getShapeTopExtentPx(origPoints, pivot);
   const stemLen = 24;
   const handleRadius = maxUpPx + stemLen;
 
@@ -199,14 +218,14 @@ function updateRotateHandle() {
     return;
   }
 
-  if (!currentRect._origCenter) {
-    currentRect._origCenter = currentRect.getBounds().getCenter();
+  if (!currentRect._pivot) {
+    currentRect._pivot = calculatePivot(currentRect);
     currentRect._origPoints = getShapeLatLngs(currentRect);
     currentRect._rotationAngle = 0;
   }
 
   const pos = calcRotateHandlePositions(
-    currentRect._origCenter,
+    currentRect._pivot,
     currentRect._origPoints,
     currentRect._rotationAngle || 0
   );
@@ -264,22 +283,22 @@ function createRotateHandle(latlng) {
 
 function rotateSelectionBy(deg) {
   if (!currentRect) return;
-  if (!currentRect._origCenter) {
-    currentRect._origCenter = currentRect.getBounds().getCenter();
+  if (!currentRect._pivot) {
+    currentRect._pivot = calculatePivot(currentRect);
     currentRect._origPoints = getShapeLatLngs(currentRect);
     currentRect._rotationAngle = 0;
   }
   const angle = (currentRect._rotationAngle || 0) + (deg * Math.PI / 180);
   currentRect._rotationAngle = angle;
 
-  const rotated = rotateShapeCoords(currentRect._origPoints, currentRect._origCenter, angle);
+  const rotated = rotateShapeCoords(currentRect._origPoints, currentRect._pivot, angle);
 
   if (currentRect instanceof L.Rectangle || currentRect instanceof L.Circle) {
-    const origCenter = currentRect._origCenter;
+    const pivot = currentRect._pivot;
     const origPoints = currentRect._origPoints;
     drawnItems.removeLayer(currentRect);
     currentRect = L.polygon(rotated, SEL_STYLE);
-    currentRect._origCenter = origCenter;
+    currentRect._pivot = pivot;
     currentRect._origPoints = origPoints;
     currentRect._rotationAngle = angle;
     makeSelectionDraggable(currentRect);
@@ -322,19 +341,19 @@ function attachRotateHandleEvents(marker) {
     mapBox.classList.add('rotate-dragging');
     document.body.classList.add('rotate-dragging');
 
-    if (!currentRect._origCenter) {
-      currentRect._origCenter = currentRect.getBounds().getCenter();
+    if (!currentRect._pivot) {
+      currentRect._pivot = calculatePivot(currentRect);
       currentRect._origPoints = getShapeLatLngs(currentRect);
       currentRect._rotationAngle = 0;
     }
 
-    const center = currentRect._origCenter;
-    const cPt = map.latLngToLayerPoint(center);
+    const pivot = currentRect._pivot;
+    const cPt = map.latLngToLayerPoint(pivot);
     const startMousePt = map.mouseEventToLayerPoint(ev);
     const startMouseAngle = Math.atan2(startMousePt.y - cPt.y, startMousePt.x - cPt.x);
     const startAngle = currentRect._rotationAngle || 0;
 
-    const maxUpPx = getShapeTopExtentPx(currentRect._origPoints, center);
+    const maxUpPx = getShapeTopExtentPx(currentRect._origPoints, pivot);
     const stemLen = 24;
     const handleRadius = maxUpPx + stemLen;
 
@@ -365,14 +384,14 @@ function attachRotateHandleEvents(marker) {
         badge.textContent = `${deg >= 0 ? '+' : ''}${deg.toFixed(1)}°`;
       }
 
-      const rotated = rotateShapeCoords(currentRect._origPoints, center, angle);
+      const rotated = rotateShapeCoords(currentRect._origPoints, pivot, angle);
 
       if (currentRect instanceof L.Rectangle || currentRect instanceof L.Circle) {
-        const origCenter = currentRect._origCenter;
+        const origPivot = currentRect._pivot;
         const origPoints = currentRect._origPoints;
         drawnItems.removeLayer(currentRect);
         currentRect = L.polygon(rotated, SEL_STYLE);
-        currentRect._origCenter = origCenter;
+        currentRect._pivot = origPivot;
         currentRect._origPoints = origPoints;
         currentRect._rotationAngle = angle;
         makeSelectionDraggable(currentRect);
@@ -452,6 +471,8 @@ function makeSelectionDraggable(layer) {
     const isCircle = layer instanceof L.Circle;
     const startLL = ev.latlng;
     const start = isCircle ? layer.getLatLng() : layer.getLatLngs();
+    const startPivot = currentRect && currentRect._pivot ? L.latLng(currentRect._pivot.lat, currentRect._pivot.lng) : null;
+    const startOrigPoints = currentRect && currentRect._origPoints ? shiftLatLngs(currentRect._origPoints, 0, 0) : null;
     let moved = false;
     map.dragging.disable();
     map.getContainer().classList.add('sel-dragging');
@@ -464,11 +485,11 @@ function makeSelectionDraggable(layer) {
       moved = true;
       if (isCircle) layer.setLatLng(L.latLng(start.lat + dLat, start.lng + dLng));
       else layer.setLatLngs(shiftLatLngs(start, dLat, dLng));
-      if (currentRect && currentRect._origCenter) {
-        currentRect._origCenter = L.latLng(currentRect._origCenter.lat + dLat, currentRect._origCenter.lng + dLng);
+      if (currentRect && startPivot) {
+        currentRect._pivot = L.latLng(startPivot.lat + dLat, startPivot.lng + dLng);
       }
-      if (currentRect && currentRect._origPoints) {
-        currentRect._origPoints = shiftLatLngs(currentRect._origPoints, dLat, dLng);
+      if (currentRect && startOrigPoints) {
+        currentRect._origPoints = shiftLatLngs(startOrigPoints, dLat, dLng);
       }
       updateBboxFields();
       updateRotateHandle();
@@ -594,6 +615,13 @@ function selectionShape() {
 // Area inside the selection in km², on a local flat projection: plenty for
 // town-sized shapes.
 function selectionAreaKm2() {
+  if (!currentRect) return null;
+  if (currentRect instanceof L.Rectangle) {
+    const b = currentRect.getBounds();
+    const s = b.getSouth(), n = b.getNorth();
+    const w = b.getWest(), e = b.getEast();
+    return haversineKm(s, w, s, e) * haversineKm(s, w, n, w);
+  }
   const shape = selectionShape();
   if (!shape) return null;
   const polys = shape.type === 'Polygon' ? [shape.coordinates] : shape.coordinates;
@@ -680,10 +708,13 @@ function updateBboxFields() {
   const buildGB = ((tilesX * tilesY * BUILD_BYTES_PER_TILE + BUILD_BASE_BYTES) / 1e9).toFixed(1);
   const fill = Math.min(100, (area / BIG_AREA_KM2) * 100);
 
+  const shapeKm2 = selectionAreaKm2();
+  const displayArea = shapeKm2 !== null ? shapeKm2 : area;
+
   stats.className = heavy.length ? 'warn' : (slow ? 'warn' : 'ok');
   stats.innerHTML = `
     <div class="tiles">
-      ${fx.tile(area, 'km²', 'area', area < 10 ? 2 : 1)}
+      ${fx.tile(displayArea, 'km²', 'area', displayArea < 10 ? 2 : 1)}
       <div class="tile"><div class="v"><span data-count="${cellsX}">0</span><small>×</small><span
         data-count="${cellsY}">0</span></div><div class="k">cells</div></div>
       ${fx.tile(tilesX * tilesY / 1e6, 'M', 'tiles', 2)}
@@ -694,9 +725,9 @@ function updateBboxFields() {
         <span>${fill < 1 ? '<1' : Math.round(fill)}% of limit</span></div>
       <div class="bar"><div class="bar-fill" style="width:${fill}%"></div></div>
     </div>
-    ${selectionAreaKm2() !== null ? `<div class="stat-note shape">Only the drawn shape is built:
-      <b>${selectionAreaKm2().toFixed(2)} km²</b> of this ${area.toFixed(2)} km² box. Outside it the land
-      turns back to countryside, with the main roads and rivers running on.</div>` : ''}
+    ${selectionShape() !== null && shapeKm2 !== null ? `<div class="stat-note shape">Only the drawn shape is built:
+      <b>${shapeKm2.toFixed(2)} km²</b> (bounding box: ${area.toFixed(1)} km², ${cellsX}×${cellsY} cells).
+      Outside it the land turns back to countryside, with the main roads and rivers running on.</div>` : ''}
     ${heavy.length ? `<div class="stat-note warn">${heavy.join(' ')}
       You can still build it — this is a heads-up, not a wall.
       ${fitScale ? `<button type="button" class="use-scale" data-scale="${fitScale.mpt}">Use ${fitScale.mpt} m/tile
