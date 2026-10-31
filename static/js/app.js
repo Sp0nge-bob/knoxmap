@@ -709,25 +709,31 @@ function updateBboxFields() {
   const fill = Math.min(100, (area / BIG_AREA_KM2) * 100);
 
   const shapeKm2 = selectionAreaKm2();
-  const displayArea = shapeKm2 !== null ? shapeKm2 : area;
+  const shapeVal = shapeKm2 !== null ? shapeKm2 : area;
+  const isRu = (document.getElementById('language') && document.getElementById('language').value === 'russian')
+    || (document.documentElement.lang === 'ru');
 
   stats.className = heavy.length ? 'warn' : (slow ? 'warn' : 'ok');
   stats.innerHTML = `
     <div class="tiles">
-      ${fx.tile(displayArea, 'km²', 'area', displayArea < 10 ? 2 : 1)}
+      ${fx.tile(shapeVal, 'km²', 'Shape area', shapeVal < 10 ? 2 : 1)}
+      ${fx.tile(area, 'km²', 'Map area', area < 10 ? 2 : 1)}
       <div class="tile"><div class="v"><span data-count="${cellsX}">0</span><small>×</small><span
-        data-count="${cellsY}">0</span></div><div class="k">cells</div></div>
-      ${fx.tile(tilesX * tilesY / 1e6, 'M', 'tiles', 2)}
-      ${fx.tile(queries, '', queries === 1 ? 'osm query' : 'osm queries')}
+        data-count="${cellsY}">0</span></div><div class="k">Cells</div></div>
+      ${fx.tile(tilesX * tilesY / 1e6, 'M', 'Tiles', 2)}
+      ${fx.tile(queries, '', queries === 1 ? 'OSM query' : 'OSM queries')}
+      ${fx.tile(Math.round(pixelsMB), 'MB', 'Bitmap', 0)}
     </div>
     <div class="meter">
       <div class="meter-top"><span>~${Math.round(widthM)} × ${Math.round(heightM)} m · ${bitmap} of bitmap · ~${buildGB} GB to add buildings</span>
         <span>${fill < 1 ? '<1' : Math.round(fill)}% of limit</span></div>
       <div class="bar"><div class="bar-fill" style="width:${fill}%"></div></div>
     </div>
-    ${selectionShape() !== null && shapeKm2 !== null ? `<div class="stat-note shape">Only the drawn shape is built:
-      <b>${shapeKm2.toFixed(2)} km²</b> (bounding box: ${area.toFixed(1)} km², ${cellsX}×${cellsY} cells).
-      Outside it the land turns back to countryside, with the main roads and rivers running on.</div>` : ''}
+    ${selectionShape() !== null && shapeKm2 !== null ? `<div class="stat-note shape">
+      ${isRu
+        ? `Застраивается только нарисованная фигура: <b>${shapeKm2.toFixed(2)} км²</b> (вся карта с сеткой ячеек: ${area.toFixed(1)} км², ${cellsX}×${cellsY} ячеек). Вне фигуры местность плавно переходит в дикую природу с продолжением основных дорог и рек.`
+        : `Only the drawn shape is built: <b>${shapeKm2.toFixed(2)} km²</b> (bounding box: ${area.toFixed(1)} km², ${cellsX}×${cellsY} cells). Outside it the land turns back to countryside, with the main roads and rivers running on.`}
+    </div>` : ''}
     ${heavy.length ? `<div class="stat-note warn">${heavy.join(' ')}
       You can still build it — this is a heads-up, not a wall.
       ${fitScale ? `<button type="button" class="use-scale" data-scale="${fitScale.mpt}">Use ${fitScale.mpt} m/tile
