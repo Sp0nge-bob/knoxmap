@@ -75,6 +75,8 @@ const drawControl = new L.Control.Draw({
 map.addControl(drawControl);
 
 let currentRect = null;
+let rotateHandleMarker = null;
+let isRotatingSelection = false;
 
 function setSelection(layer) {
   drawnItems.clearLayers();
@@ -82,7 +84,228 @@ function setSelection(layer) {
   makeSelectionDraggable(layer);
   drawnItems.addLayer(currentRect);
   updateBboxFields();
+  updateRotateHandle();
 }
+
+// ---- rotate the selection (Photoshop style) ------------------------------------
+function rotateSingleLatLng(ll, center, rad) {
+  const cosLat = Math.cos(center.lat * Math.PI / 180);
+  const dx = (ll.lng - center.lng) * cosLat;
+  const dy = ll.lat - center.lat;
+  // Clockwise rotation on the map (North is +Y, East is +X)
+  const rx = dx * Math.cos(rad) + dy * Math.sin(rad);
+  const ry = -dx * Math.sin(rad) + dy * Math.cos(rad);
+  return L.latLng(center.lat + ry, wrapLon(center.lng + rx / cosLat));
+}
+
+function rotateShapeCoords(item, center, rad) {
+  if (Array.isArray(item)) {
+    return item.map(child => rotateShapeCoords(child, center, rad));
+  }
+  return rotateSingleLatLng(item, center, rad);
+}
+
+function getShapeLatLngs(layer) {
+  if (layer instanceof L.Rectangle) {
+    const b = layer.getBounds();
+    return [
+      L.latLng(b.getNorth(), b.getWest()),
+      L.latLng(b.getNorth(), b.getEast()),
+      L.latLng(b.getSouth(), b.getEast()),
+      L.latLng(b.getSouth(), b.getWest()),
+    ];
+  }
+  if (layer instanceof L.Circle) {
+    const c = layer.getLatLng();
+    const r = layer.getRadius();
+    const pts = [];
+    for (let i = 0; i < 64; i++) {
+      const a = (i / 64) * 2 * Math.PI;
+      const dLat = (r * Math.cos(a)) / 111320;
+      const dLon = (r * Math.sin(a)) / (111320 * Math.cos(c.lat * Math.PI / 180));
+      pts.push(L.latLng(c.lat + dLat, wrapLon(c.lng + dLon)));
+    }
+    return pts;
+  }
+  if (layer instanceof L.Polygon) {
+    const raw = layer.getLatLngs();
+    return Array.isArray(raw[0]) ? raw[0] : raw;
+  }
+  return [];
+}
+
+function rotateSelectionBy(deg) {
+  if (!currentRect) return;
+  const center = currentRect.getBounds().getCenter();
+  const rad = deg * Math.PI / 180;
+  const initialPts = getShapeLatLngs(currentRect);
+  const rotated = rotateShapeCoords(initialPts, center, rad);
+
+  if (currentRect instanceof L.Rectangle || currentRect instanceof L.Circle) {
+    drawnItems.removeLayer(currentRect);
+    currentRect = L.polygon(rotated, SEL_STYLE);
+    makeSelectionDraggable(currentRect);
+    drawnItems.addLayer(currentRect);
+  } else {
+    currentRect.setLatLngs(rotated);
+  }
+
+  updateBboxFields();
+  updateRotateHandle();
+}
+
+function updateRotateHandle() {
+  if (!currentRect || !drawnItems.hasLayer(currentRect)) {
+    if (rotateHandleMarker) {
+      map.removeLayer(rotateHandleMarker);
+      rotateHandleMarker = null;
+    }
+    return;
+  }
+  const bounds = currentRect.getBounds();
+  const topCenter = L.latLng(bounds.getNorth(), bounds.getCenter().lng);
+
+  if (!rotateHandleMarker) {
+    createRotateHandle(topCenter);
+  } else {
+    rotateHandleMarker.setLatLng(topCenter);
+    attachRotateHandleEvents(rotateHandleMarker);
+  }
+}
+
+function createRotateHandle(latlng) {
+  if (rotateHandleMarker) {
+    map.removeLayer(rotateHandleMarker);
+    rotateHandleMarker = null;
+  }
+
+  const icon = L.divIcon({
+    className: 'rotate-handle-icon-container',
+    html: `
+      <div class="rotate-handle-wrapper">
+        <div class="rotate-handle-badge" style="display: none;">0°</div>
+        <button type="button" class="rotate-handle-btn" title="Rotate area (drag to rotate, Shift to snap, or click to turn 45°)" aria-label="Rotate area">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.19"/>
+          </svg>
+        </button>
+        <div class="rotate-handle-stem"></div>
+      </div>
+    `,
+    iconSize: [32, 48],
+    iconAnchor: [16, 48],
+  });
+
+  rotateHandleMarker = L.marker(latlng, {
+    icon: icon,
+    interactive: true,
+    zIndexOffset: 2000,
+  }).addTo(map);
+
+  attachRotateHandleEvents(rotateHandleMarker);
+}
+
+function attachRotateHandleEvents(marker) {
+  const el = marker.getElement();
+  if (!el || el._rotateEventsAttached) return;
+  el._rotateEventsAttached = true;
+
+  const btn = el.querySelector('.rotate-handle-btn');
+  const badge = el.querySelector('.rotate-handle-badge');
+  if (!btn) return;
+
+  L.DomEvent.disableClickPropagation(btn);
+  L.DomEvent.disableScrollPropagation(btn);
+
+  btn.addEventListener('contextmenu', (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    rotateSelectionBy(-45);
+  });
+
+  btn.addEventListener('mousedown', (ev) => {
+    if (ev.button !== 0) return;
+    if (!currentRect) return;
+    L.DomEvent.stop(ev);
+    L.DomEvent.preventDefault(ev);
+
+    isRotatingSelection = true;
+    map.dragging.disable();
+    const mapBox = map.getContainer();
+    mapBox.classList.add('rotate-dragging');
+    document.body.classList.add('rotate-dragging');
+
+    const center = currentRect.getBounds().getCenter();
+    const centerPt = map.latLngToContainerPoint(center);
+    const startPt = map.mouseEventToContainerPoint(ev);
+    const startAngle = Math.atan2(startPt.y - centerPt.y, startPt.x - centerPt.x);
+
+    let initialPts = getShapeLatLngs(currentRect);
+    let moved = false;
+
+    const onMove = (e) => {
+      const curPt = map.mouseEventToContainerPoint(e);
+      if (!moved && Math.hypot(curPt.x - startPt.x, curPt.y - startPt.y) < 3) return;
+      moved = true;
+
+      const curAngle = Math.atan2(curPt.y - centerPt.y, curPt.x - centerPt.x);
+      let delta = curAngle - startAngle;
+
+      if (e.shiftKey) {
+        const snapStep = Math.PI / 12; // 15 degrees
+        delta = Math.round(delta / snapStep) * snapStep;
+      }
+
+      let deg = (delta * 180 / Math.PI) % 360;
+      if (deg > 180) deg -= 360;
+      if (deg < -180) deg += 360;
+
+      if (badge) {
+        badge.style.display = 'block';
+        badge.textContent = `${deg >= 0 ? '+' : ''}${deg.toFixed(1)}°`;
+      }
+
+      const rotated = rotateShapeCoords(initialPts, center, delta);
+
+      if (currentRect instanceof L.Rectangle || currentRect instanceof L.Circle) {
+        drawnItems.removeLayer(currentRect);
+        currentRect = L.polygon(rotated, SEL_STYLE);
+        makeSelectionDraggable(currentRect);
+        drawnItems.addLayer(currentRect);
+      } else {
+        currentRect.setLatLngs(rotated);
+      }
+
+      updateBboxFields();
+      const newBounds = currentRect.getBounds();
+      marker.setLatLng(L.latLng(newBounds.getNorth(), newBounds.getCenter().lng));
+    };
+
+    const onUp = () => {
+      window.removeEventListener('mousemove', onMove, true);
+      window.removeEventListener('mouseup', onUp, true);
+      map.dragging.enable();
+      mapBox.classList.remove('rotate-dragging');
+      document.body.classList.remove('rotate-dragging');
+      isRotatingSelection = false;
+
+      if (badge) badge.style.display = 'none';
+
+      if (!moved) {
+        rotateSelectionBy(45);
+        return;
+      }
+
+      updateBboxFields();
+      updateRotateHandle();
+    };
+
+    window.addEventListener('mousemove', onMove, true);
+    window.addEventListener('mouseup', onUp, true);
+  });
+}
+
+map.on('zoomend', updateRotateHandle);
 
 // ---- drag the selection --------------------------------------------------------
 // Press on the chosen area and drag it to somewhere else; the size and shape
@@ -102,6 +325,7 @@ function makeSelectionDraggable(layer) {
   layer.on('mousedown', (ev) => {
     const oe = ev.originalEvent;
     if (oe && oe.button !== undefined && oe.button !== 0) return;
+    if (isRotatingSelection) return;
     if (selDrawing || map.getContainer().classList.contains('lasso-armed')) return;
     if (layer.editing && layer.editing.enabled && layer.editing.enabled()) return;
     if (!drawnItems.hasLayer(layer)) return;
@@ -123,6 +347,7 @@ function makeSelectionDraggable(layer) {
       if (isCircle) layer.setLatLng(L.latLng(start.lat + dLat, start.lng + dLng));
       else layer.setLatLngs(shiftLatLngs(start, dLat, dLng));
       updateBboxFields();
+      updateRotateHandle();
     };
     const up = () => {
       map.off('mousemove', move);
@@ -130,6 +355,7 @@ function makeSelectionDraggable(layer) {
       map.dragging.enable();
       map.getContainer().classList.remove('sel-dragging');
       if (moved) updateBboxFields();
+      updateRotateHandle();
     };
     map.on('mousemove', move);
     document.addEventListener('mouseup', up, true);
@@ -262,10 +488,14 @@ function selectionAreaKm2() {
   }
   return total;
 }
-map.on(L.Draw.Event.EDITED, () => updateBboxFields());
+map.on(L.Draw.Event.EDITED, () => {
+  updateBboxFields();
+  updateRotateHandle();
+});
 map.on(L.Draw.Event.DELETED, () => {
   currentRect = null;
   clearBboxFields();
+  updateRotateHandle();
 });
 
 // Leaflet reports coordinates *unwrapped* once the map has been panned across
@@ -415,6 +645,7 @@ function clearBboxFields() {
   document.getElementById('landmarksBtn').disabled = true;
   document.getElementById('landmark-results').innerHTML = '';
   fx.resetFrom('area');
+  updateRotateHandle();
 }
 
 // The scale is typed, so it can be empty, half-typed or out of range. Whole

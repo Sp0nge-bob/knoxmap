@@ -504,3 +504,4 @@ Click on a feature to remove. = Кликни по объекту, чтобы у�
 Layers = Слои
 Zoom in = Приблизить
 Zoom out = Отдалить
+Rotate area (drag to rotate, Shift to snap, or click to turn 45°) = Повернуть область (потяните для вращения, Shift для шага 15°, клик для +45°)
